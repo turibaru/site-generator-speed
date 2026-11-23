@@ -4,29 +4,39 @@ function byCodeUnits(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESCAPE_RE = /[&<>"']/g;
+
 function escapeHtml(text) {
-  const t = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-  return text.replace(/[&<>"']/g, c => t[c]);
+  if (text.indexOf('&') === -1 && text.indexOf('<') === -1 && text.indexOf('>') === -1 && text.indexOf('"') === -1 && text.indexOf("'") === -1) return text;
+  return text.replace(ESCAPE_RE, c => ESCAPE_MAP[c]);
 }
 
+const slugCache = new Map();
+
 function slugify(text) {
+  const hit = slugCache.get(text);
+  if (hit !== undefined) return hit;
   let ascii = true;
   for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) >= 128) { ascii = false; break; }
   const plain = ascii ? text : text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = '';
+  const parts = [];
   let dash = false;
-  for (const ch of plain) {
-    let c = ch;
+  for (let i = 0; i < plain.length; i++) {
+    let c = plain[i];
     if (c >= 'A' && c <= 'Z') c = c.toLowerCase();
-    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) { out += c; dash = false; }
-    else if (out && !dash) { out += '-'; dash = true; }
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) { parts.push(c); dash = false; }
+    else if (parts.length > 0 && !dash) { parts.push('-'); dash = true; }
   }
+  let out = parts.join('');
   if (out.endsWith('-')) out = out.slice(0, -1);
   if (out.length > 64) {
     out = out.slice(0, 64);
     if (out.endsWith('-')) out = out.slice(0, -1);
   }
-  return out || 'untitled';
+  const result = out || 'untitled';
+  slugCache.set(text, result);
+  return result;
 }
 
 function uniqueSlug(slug, taken) {
@@ -44,8 +54,17 @@ function longDate(date) {
 }
 
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m ? m.length : 0;
+  let n = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    let ws;
+    if (c < 128) ws = c === 32 || (c >= 9 && c <= 13);
+    else ws = c === 0xA0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
+    if (ws) inWord = false;
+    else if (!inWord) { inWord = true; n++; }
+  }
+  return n;
 }
 
 const KEYS = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
@@ -60,20 +79,20 @@ function stringOf(k, raw) {
   if (raw[0] === '"') {
     if (raw.length < 2 || raw[raw.length - 1] !== '"') return { error: 'key "' + k + '": a quoted string is not closed' };
     let out = '';
+    let start = 1;
     for (let i = 1; i < raw.length - 1; i++) {
       const c = raw[i];
       if (c === '\\') {
         const n = raw[i + 1];
         if ((n !== '"' && n !== '\\') || i + 1 === raw.length - 1) return { error: 'key "' + k + '": a quoted string holds an escape other than \\" or \\\\' };
-        out += n;
+        out += raw.slice(start, i) + n;
+        start = i + 2;
         i++;
       } else if (c === '"') {
         return { error: 'key "' + k + '": a quoted string holds a stray quote' };
-      } else {
-        out += c;
       }
     }
-    return { value: out };
+    return { value: out + raw.slice(start, raw.length - 1) };
   }
   if (raw[0] === '[') return { error: 'key "' + k + '": a bare string opens on [' };
   return { value: raw };
@@ -158,7 +177,13 @@ function headingOf(line) {
 }
 
 function endsParagraph(line) {
-  return BLANK.test(line) || FENCE_OPEN.test(line) || headingOf(line) !== null || HR.test(line);
+  if (line === '') return true;
+  const c0 = line[0];
+  if (c0 === ' ' || c0 === '\t') return BLANK.test(line);
+  if (c0 === '`') return FENCE_OPEN.test(line);
+  if (c0 === '#') return headingOf(line) !== null;
+  if (c0 === '-' || c0 === '*') return HR.test(line);
+  return false;
 }
 
 function trimLine(line) {
@@ -171,8 +196,8 @@ function lex(src) {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (BLANK.test(line)) { i++; continue; }
-    const fence = FENCE_OPEN.exec(line);
+    if (line === '' || ((line[0] === ' ' || line[0] === '\t') && BLANK.test(line))) { i++; continue; }
+    const fence = line[0] === '`' ? FENCE_OPEN.exec(line) : null;
     if (fence !== null) {
       const body = [];
       i++;
@@ -181,25 +206,25 @@ function lex(src) {
       tokens.push({ type: 'code', lang: fence[1], lines: body });
       continue;
     }
-    const heading = headingOf(line);
+    const heading = line[0] === '#' ? headingOf(line) : null;
     if (heading !== null) {
       tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
       i++;
       continue;
     }
-    if (HR.test(line)) {
+    if ((line[0] === '-' || line[0] === '*') && HR.test(line)) {
       tokens.push({ type: 'hr' });
       i++;
       continue;
     }
-    if (QUOTE.test(line)) {
+    if (line[0] === '>' && QUOTE.test(line)) {
       const body = [];
       while (i < lines.length && QUOTE.test(lines[i])) { body.push(lines[i].replace(/^> ?/, '')); i++; }
       tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter(l => l !== '') });
       continue;
     }
-    const bullet = BULLET.exec(line);
-    const ordered = bullet !== null ? null : ORDERED.exec(line);
+    const bullet = (line[0] === '-' || line[0] === '*') ? BULLET.exec(line) : null;
+    const ordered = bullet !== null ? null : (line[0] >= '0' && line[0] <= '9' ? ORDERED.exec(line) : null);
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? ORDERED : BULLET;
@@ -209,7 +234,7 @@ function lex(src) {
         if (m !== null) {
           items.push([trimLine(isOrdered ? m[2] : m[1])]);
           i++;
-        } else if (CONTINUED.test(lines[i])) {
+        } else if (lines[i][0] === ' ' && lines[i][1] === ' ' && CONTINUED.test(lines[i])) {
           items[items.length - 1].push(trimLine(lines[i]));
           i++;
         } else break;
@@ -250,35 +275,42 @@ function inline(s, env) {
   let out = '';
   let i = 0;
   while (i < s.length) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
-      out += escapeHtml(s[i + 1]);
-      i += 2;
+    let j = s.length;
+    let k = s.indexOf('\\', i); if (k !== -1 && k < j) j = k;
+    k = s.indexOf('`', i); if (k !== -1 && k < j) j = k;
+    k = s.indexOf('*', i); if (k !== -1 && k < j) j = k;
+    k = s.indexOf('[', i); if (k !== -1 && k < j) j = k;
+    if (j > i) out += escapeHtml(s.slice(i, j));
+    if (j === s.length) break;
+    const c = s[j];
+    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+      out += s[j + 1];
+      i = j + 2;
     } else if (c === '`') {
-      const j = s.indexOf('`', i + 1);
-      if (j > i + 1) { out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`; i = j + 1; }
-      else { out += '`'; i++; }
+      const m = s.indexOf('`', j + 1);
+      if (m > j + 1) { out += `<code>${escapeHtml(s.slice(j + 1, m))}</code>`; i = m + 1; }
+      else { out += '`'; i = j + 1; }
     } else if (c === '*') {
-      if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) { out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`; i = j + 2; }
-        else { out += '**'; i += 2; }
+      if (s[j + 1] === '*') {
+        const m = findUnescaped(s, '**', j + 2);
+        if (m > j + 2) { out += `<strong>${inline(s.slice(j + 2, m), env)}</strong>`; i = m + 2; }
+        else { out += '**'; i = j + 2; }
       } else {
-        const j = findSingleStar(s, i + 1);
-        if (j > i + 1) { out += `<em>${inline(s.slice(i + 1, j), env)}</em>`; i = j + 1; }
-        else { out += '*'; i++; }
+        const m = findSingleStar(s, j + 1);
+        if (m > j + 1) { out += `<em>${inline(s.slice(j + 1, m), env)}</em>`; i = m + 1; }
+        else { out += '*'; i = j + 1; }
       }
     } else if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const m = (k !== -1 && s[k + 1] === '(') ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const k2 = findUnescaped(s, ']', j + 1);
+      const m = (k2 !== -1 && s[k2 + 1] === '(') ? s.indexOf(')', k2 + 2) : -1;
+      const target = m === -1 ? '' : s.slice(k2 + 2, m);
       if (target !== '' && !/\s/.test(target)) {
-        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(i + 1, k), env)}</a>`;
+        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(j + 1, k2), env)}</a>`;
         i = m + 1;
-      } else { out += '['; i++; }
+      } else { out += '['; i = j + 1; }
     } else {
-      out += escapeHtml(c);
-      i++;
+      out += c;
+      i = j + 1;
     }
   }
   return out;
@@ -297,7 +329,7 @@ function renderMarkdown(src, env) {
       if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
     } else if (t.type === 'code') {
       const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-      blocks.push(`<pre><code${cls}>${t.lines.map(l => escapeHtml(l) + '\n').join('')}</code></pre>`);
+      blocks.push(`<pre><code${cls}>${t.lines.length === 0 ? '' : t.lines.map(escapeHtml).join('\n') + '\n'}</code></pre>`);
     } else if (t.type === 'hr') {
       blocks.push('<hr>');
     } else if (t.type === 'blockquote') {
@@ -306,14 +338,14 @@ function renderMarkdown(src, env) {
     } else if (t.type === 'list') {
       const tag = t.ordered ? 'ol' : 'ul';
       const open = (t.ordered && t.start !== 1) ? `<ol start="${t.start}">` : `<${tag}>`;
-      blocks.push(`${open}\n${t.items.map(item => `<li>${inline(item, env)}</li>\n`).join('')}</${tag}>`);
+      blocks.push(`${open}\n${t.items.map(item => `<li>${inline(item, env)}</li>`).join('\n') + '\n'}</${tag}>`);
     } else if (t.type === 'paragraph') {
       const html = inline(t.text, env);
       if (excerpt === null) excerpt = html;
       blocks.push(`<p>${html}</p>`);
     }
   }
-  return { html: blocks.map(b => b + '\n').join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt ?? '' };
 }
 
 // ---- Bagian 3: Template + pipeline + run ----
@@ -438,10 +470,16 @@ function renderNodes(nodes, scope, ctx, depth) {
     } else if (n.kind === 'for') {
       const xs = lookup(scope, n.path);
       if (!Array.isArray(xs)) continue;
-      xs.forEach((x, k) => {
-        const vars = { [n.name]: x, loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-        out += renderNodes(n.body, { vars, parent: scope }, ctx, depth);
-      });
+      const child = { vars: {}, parent: scope };
+      const loop = { index: 0, first: true, last: false, length: xs.length };
+      child.vars.loop = loop;
+      for (let k = 0; k < xs.length; k++) {
+        child.vars[n.name] = xs[k];
+        loop.index = k + 1;
+        loop.first = k === 0;
+        loop.last = k === xs.length - 1;
+        out += renderNodes(n.body, child, ctx, depth);
+      }
     } else if (n.kind === 'include') {
       const t = ctx.templates.get(n.name);
       if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
@@ -476,7 +514,7 @@ function cardOf(s) {
 }
 
 function pageOf(s) {
-  return { ...cardOf(s), slug: s.slug, content: s.html, toc: s.toc.map(h => ({ level: h.level, id: h.id, html: h.html })), newer: linkOf(s.newer ?? null), older: linkOf(s.older ?? null), is_post: s.post };
+  return { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date), summary: s.data.summary ?? '', excerpt: s.excerpt, reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)), tags: s.tagRefs.map(t => ({ name: t.name, slug: t.slug, url: t.url })), slug: s.slug, content: s.html, toc: s.toc.map(h => ({ level: h.level, id: h.id, html: h.html })), newer: linkOf(s.newer ?? null), older: linkOf(s.older ?? null), is_post: s.post };
 }
 
 function tagOf(b, t) {
